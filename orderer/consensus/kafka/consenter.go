@@ -53,6 +53,9 @@ func New(config localconfig.Kafka, mp metrics.Provider, healthChecker healthChec
 		},
 		healthChecker: healthChecker,
 		metrics:       metrics,
+		// !!! BEGIN MODIFICATIONS
+		kafkaConfigVal: config,
+		// !!! END MODIFICATIONS
 	}, metrics
 }
 
@@ -76,6 +79,9 @@ type consenterImpl struct {
 	healthChecker         healthChecker
 	metrics               *Metrics
 	inactiveChainRegistry InactiveChainRegistry
+	// !!! BEGIN MODIFICATIONS
+	kafkaConfigVal localconfig.Kafka
+	// !!! END MODIFICATIONS
 }
 
 // HandleChain creates/returns a reference to a consensus.Chain object for the
@@ -112,6 +118,9 @@ type commonConsenter interface {
 	retryOptions() localconfig.Retry
 	topicDetail() *sarama.TopicDetail
 	Metrics() *Metrics
+	// !!! BEGIN MODIFICATIONS
+	kafkaConfig() localconfig.Kafka
+	// !!! END MODIFICATIONS
 }
 
 func (consenter *consenterImpl) Metrics() *Metrics {
@@ -129,3 +138,11 @@ func (consenter *consenterImpl) retryOptions() localconfig.Retry {
 func (consenter *consenterImpl) topicDetail() *sarama.TopicDetail {
 	return consenter.topicDetailVal
 }
+
+// !!! BEGIN MODIFICATIONS
+
+func (consenter *consenterImpl) kafkaConfig() localconfig.Kafka {
+	return consenter.kafkaConfigVal
+}
+
+// !!! END MODIFICATIONS

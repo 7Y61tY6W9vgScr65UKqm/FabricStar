@@ -8,6 +8,7 @@ package kafka
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"strconv"
 	"sync"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/Shopify/sarama"
 	"github.com/golang/protobuf/proto"
+	"github.com/hyperledger/fabric/core/committer/txvalidator"
 	"github.com/hyperledger/fabric/orderer/common/localconfig"
 	"github.com/hyperledger/fabric/orderer/common/msgprocessor"
 	"github.com/hyperledger/fabric/orderer/consensus"
@@ -93,14 +95,23 @@ type chainImpl struct {
 	consensus.ConsenterSupport
 
 	channel                     channel
+	lastKafkaOffset             int64
 	lastOffsetPersisted         int64
 	lastOriginalOffsetProcessed int64
 	lastResubmittedConfigOffset int64
 	lastCutBlockNumber          uint64
 
-	producer        syncProducer
-	parentConsumer  sarama.Consumer
-	channelConsumer sarama.PartitionConsumer
+	producer syncProducer
+	// !!! BEGIN MODIFICATION
+	// parentConsumer  sarama.Consumer
+	// channelConsumer sarama.PartitionConsumer
+	// !!! END MODIFICATION
+
+	// !!! BEGIN MODIFICATION
+	parentHeaderConsumer  sarama.Consumer
+	channelHeaderConsumer sarama.PartitionConsumer
+	connectOrTTCPayload   []*ab.KafkaPayload
+	// !!! END MODIFICATION
 
 	// mutex used when changing the doneReprocessingMsgInFlight
 	doneReprocessingMutex sync.Mutex
@@ -256,6 +267,7 @@ func (chain *chainImpl) enqueue(kafkaMsg *ab.KafkaMessage) bool {
 				return false
 			}
 			message := newProducerMessage(chain.channel, payload)
+			logger.Debugf("!!§!! Enqueueing Data: ", message)
 			if _, _, err = chain.producer.SendMessage(message); err != nil {
 				logger.Errorf("[channel: %s] cannot enqueue envelope because = %s", chain.ChainID(), err)
 				return false
@@ -310,19 +322,36 @@ func startThread(chain *chainImpl) {
 	}
 	logger.Infof("[channel: %s] CONNECT message posted successfully", chain.channel.topic())
 
-	// Set up the parent consumer
-	chain.parentConsumer, err = setupParentConsumerForChannel(chain.consenter.retryOptions(), chain.haltChan, chain.SharedConfig().KafkaBrokers(), chain.consenter.brokerConfig(), chain.channel)
+	// !!! BEGIN MODIFICATIONS
+	// // Set up the parent consumer
+	// chain.parentConsumer, err = setupParentConsumerForChannel(chain.consenter.retryOptions(), chain.haltChan, chain.SharedConfig().KafkaBrokers(), chain.consenter.brokerConfig(), chain.channel)
+	// if err != nil {
+	// 	logger.Panicf("[channel: %s] Cannot set up parent consumer = %s", chain.channel.topic(), err)
+	// }
+	// logger.Infof("[channel: %s] Parent consumer set up successfully", chain.channel.topic())
+
+	// // Set up the channel consumer
+	// chain.channelConsumer, err = setupChannelConsumerForChannel(chain.consenter.retryOptions(), chain.haltChan, chain.parentConsumer, chain.channel, chain.lastOffsetPersisted+1)
+	// if err != nil {
+	// 	logger.Panicf("[channel: %s] Cannot set up channel consumer = %s", chain.channel.topic(), err)
+	// }
+	// logger.Infof("[channel: %s] Channel consumer set up successfully", chain.channel.topic())
+
+	// Set up the parent header consumer
+	chain.parentHeaderConsumer, err = setupParentHeaderConsumerForChannel(chain.consenter, chain.consenter.retryOptions(), chain.haltChan, chain.SharedConfig().KafkaBrokers(), chain.consenter.brokerConfig(), chain.channel)
 	if err != nil {
-		logger.Panicf("[channel: %s] Cannot set up parent consumer = %s", chain.channel.topic(), err)
+		logger.Panicf("!!§!! [channel: %s] Cannot set up parent header consumer = %s !!§!!", chain.channel.topic(), err)
 	}
-	logger.Infof("[channel: %s] Parent consumer set up successfully", chain.channel.topic())
+	logger.Infof("!!§!! [channel: %s] Parent header consumer set up successfully !!§!!", chain.channel.topic())
 
 	// Set up the channel consumer
-	chain.channelConsumer, err = setupChannelConsumerForChannel(chain.consenter.retryOptions(), chain.haltChan, chain.parentConsumer, chain.channel, chain.lastOffsetPersisted+1)
+	chain.channelHeaderConsumer, err = setupChannelHeaderConsumerForChannel(chain.consenter.retryOptions(), chain.haltChan, chain.parentHeaderConsumer, chain.channel, chain.lastOffsetPersisted+1)
 	if err != nil {
-		logger.Panicf("[channel: %s] Cannot set up channel consumer = %s", chain.channel.topic(), err)
+		logger.Panicf("!!§!! [channel: %s] Cannot set up channel header consumer = %s !!$!!", chain.channel.topic(), err)
 	}
-	logger.Infof("[channel: %s] Channel consumer set up successfully", chain.channel.topic())
+	logger.Infof("!!$!! [channel: %s] Channel consumer set up successfully !!$!!", chain.channel.topic())
+
+	// !!! END MODIFICATIONS
 
 	chain.replicaIDs, err = getHealthyClusterReplicaInfo(chain.consenter.retryOptions(), chain.haltChan, chain.SharedConfig().KafkaBrokers(), chain.consenter.brokerConfig(), chain.channel)
 	if err != nil {
@@ -370,7 +399,7 @@ func (chain *chainImpl) processMessagesToBlocks() ([]uint64, error) {
 			logger.Warningf("[channel: %s] Consenter for channel exiting", chain.ChainID())
 			counts[indexExitChanPass]++
 			return counts, nil
-		case kafkaErr := <-chain.channelConsumer.Errors():
+		case kafkaErr := <-chain.channelHeaderConsumer.Errors():
 			logger.Errorf("[channel: %s] Error during consumption: %s", chain.ChainID(), kafkaErr)
 			counts[indexRecvError]++
 			select {
@@ -430,7 +459,8 @@ func (chain *chainImpl) processMessagesToBlocks() ([]uint64, error) {
 			// make chain available again via CONNECT message trigger
 			go sendConnectMessage(chain.consenter.retryOptions(), chain.haltChan, chain.producer, chain.channel)
 
-		case in, ok := <-chain.channelConsumer.Messages():
+		// Messages returns the read channel for the messages that are returned by the broker
+		case in, ok := <-chain.channelHeaderConsumer.Messages():
 			if !ok {
 				logger.Criticalf("[channel: %s] Kafka consumer closed.", chain.ChainID())
 				return counts, nil
@@ -455,6 +485,47 @@ func (chain *chainImpl) processMessagesToBlocks() ([]uint64, error) {
 				logger.Infof("[channel: %s] Marked consenter as available again", chain.ChainID())
 			default:
 			}
+
+			// !!! BEGIN MODIFICATION
+			logger.Infof("!!§!! Expected %d Got %d !!§!!", chain.lastKafkaOffset, in.Offset)
+			if in.Offset != chain.lastKafkaOffset {
+				logger.Errorf("!!$!! Invalid Kafka Sequence Number, ignoring message... !!$!! ")
+				return counts, fmt.Errorf("!!$!! Invalid Kafka Sequence Number, ignoring message... !!$!! ")
+			}
+			chain.lastKafkaOffset++
+			unixMillis := in.Timestamp.UnixNano() / 1000000
+			consumerMessageData := make([]byte, 16)
+			logger.Warningf("!!§!! Kafka Offset is ", in.Offset, " !!§!!")
+			binary.BigEndian.PutUint64(consumerMessageData[0:8], uint64(in.Offset))
+			binary.BigEndian.PutUint64(consumerMessageData[8:16], uint64(unixMillis))
+			consumerMessageData = append(consumerMessageData, in.Value...)
+
+			proof := txvalidator.GetProofFromBytes(in.Headers[0].Value)
+
+			logger.Infof("!!§!! Checking Kafka Merkle Proof !!§!!")
+
+			logger.Infof("!!§!! Kafka Data: ", consumerMessageData, " !!§!!")
+
+			//Verify Merkle Proof
+			if !proof.VerifyProof(consumerMessageData) {
+				logger.Errorf("!!$!! Invalid Merkle Proof of Kafka Message, ignoring message... !!$!! ")
+				return counts, fmt.Errorf("!!$!! Invalid Merkle Proof of Kafka Message, ignoring message... !!$!! ")
+			}
+
+			logger.Infof("!!§!! Kafka Proof is valid !!§!!")
+			logger.Infof("!!§!! Checking Kafka Signature of Message !!§!!")
+
+			//Verify Signature
+			if err := proof.VerifySignature(in.Headers[1].Value); err != nil {
+				logger.Errorf("!!§!! ", err, " !!§!!")
+				logger.Errorf("!!$!! Invalid Kafka Signature, ignoring message... !!$!!")
+				return counts, fmt.Errorf("!!$!! Invalid Kafka Signature, ignoring message... !!$!!")
+			}
+
+			logger.Infof("!!§!! Kafka Signature is valid !!§!!")
+			// !!! END MODIFICATION
+
+			//msg stores message recvd by kafka
 			if err := proto.Unmarshal(in.Value, msg); err != nil {
 				// This shouldn't happen, it should be filtered at ingress
 				logger.Criticalf("[channel: %s] Unable to unmarshal consumed message = %s", chain.ChainID(), err)
@@ -466,10 +537,12 @@ func (chain *chainImpl) processMessagesToBlocks() ([]uint64, error) {
 			}
 			switch msg.Type.(type) {
 			case *ab.KafkaMessage_Connect:
-				_ = chain.processConnect(chain.ChainID())
+				_ = chain.processConnect(chain.ChainID(), in.Offset, consumerMessageData, in.Headers)
 				counts[indexProcessConnectPass]++
 			case *ab.KafkaMessage_TimeToCut:
-				if err := chain.processTimeToCut(msg.GetTimeToCut(), in.Offset); err != nil {
+				// !!! BEGIN MODIFICATION
+				if err := chain.processTimeToCut(msg.GetTimeToCut(), in.Offset, consumerMessageData, in.Headers); err != nil {
+					// !!! END MODIFICATION
 					logger.Warningf("[channel: %s] %s", chain.ChainID(), err)
 					logger.Criticalf("[channel: %s] Consenter for channel exiting", chain.ChainID())
 					counts[indexProcessTimeToCutError]++
@@ -477,7 +550,9 @@ func (chain *chainImpl) processMessagesToBlocks() ([]uint64, error) {
 				}
 				counts[indexProcessTimeToCutPass]++
 			case *ab.KafkaMessage_Regular:
-				if err := chain.processRegular(msg.GetRegular(), in.Offset); err != nil {
+				// !!! BEGIN MODIFICATIONS
+				if err := chain.processRegular(msg.GetRegular(), in.Headers, in.Offset, unixMillis, consumerMessageData); err != nil {
+					// !!! END MODIFICATIONS
 					logger.Warningf("[channel: %s] Error when processing incoming message of type REGULAR = %s", chain.ChainID(), err)
 					counts[indexProcessRegularError]++
 				} else {
@@ -485,6 +560,7 @@ func (chain *chainImpl) processMessagesToBlocks() ([]uint64, error) {
 				}
 			}
 		case <-chain.timer:
+			//brokerConfig.Version = tempVersion
 			if err := sendTimeToCut(chain.producer, chain.channel, chain.lastCutBlockNumber+1, &chain.timer); err != nil {
 				logger.Errorf("[channel: %s] cannot post time-to-cut message = %s", chain.ChainID(), err)
 				// Do not return though
@@ -499,7 +575,7 @@ func (chain *chainImpl) processMessagesToBlocks() ([]uint64, error) {
 func (chain *chainImpl) closeKafkaObjects() []error {
 	var errs []error
 
-	err := chain.channelConsumer.Close()
+	err := chain.channelHeaderConsumer.Close()
 	if err != nil {
 		logger.Errorf("[channel: %s] could not close channelConsumer cleanly = %s", chain.ChainID(), err)
 		errs = append(errs, err)
@@ -507,7 +583,7 @@ func (chain *chainImpl) closeKafkaObjects() []error {
 		logger.Debugf("[channel: %s] Closed the channel consumer", chain.ChainID())
 	}
 
-	err = chain.parentConsumer.Close()
+	err = chain.parentHeaderConsumer.Close()
 	if err != nil {
 		logger.Errorf("[channel: %s] could not close parentConsumer cleanly = %s", chain.ChainID(), err)
 		errs = append(errs, err)
@@ -594,19 +670,42 @@ func newTimeToCutMessage(blockNumber uint64) *ab.KafkaMessage {
 }
 
 func newProducerMessage(channel channel, pld []byte) *sarama.ProducerMessage {
+	var tempHeader sarama.RecordHeader
+	tempHeader.Key = []byte("TestHeader")
+	tempHeader.Value = []byte("TestValue")
 	return &sarama.ProducerMessage{
 		Topic: channel.topic(),
 		Key:   sarama.StringEncoder(strconv.Itoa(int(channel.partition()))), // TODO Consider writing an IntEncoder?
 		Value: sarama.ByteEncoder(pld),
+		// Headers: []sarama.RecordHeader{tempHeader},
 	}
 }
 
-func (chain *chainImpl) processConnect(channelName string) error {
+// !!! BEGIN MODIFICATION
+func (chain *chainImpl) processConnect(channelName string, receivedOffset int64, consumerMessageData []byte, messageHeaders []*sarama.RecordHeader) error {
+	if chain.connectOrTTCPayload == nil {
+		chain.connectOrTTCPayload = make([]*ab.KafkaPayload, 0)
+	}
+
+	connectOrTTCPayload := &ab.KafkaPayload{
+		KafkaMerkleProofHeader: messageHeaders[0].Value,
+		KafkaSignatureHeader:   messageHeaders[1].Value,
+		ConsumerMessageBytes:   consumerMessageData,
+	}
+
+	chain.connectOrTTCPayload = append(chain.connectOrTTCPayload, connectOrTTCPayload)
+
+	// !!! END MODIFICATION
+
 	logger.Debugf("[channel: %s] It's a connect message - ignoring", channelName)
 	return nil
 }
 
-func (chain *chainImpl) processRegular(regularMessage *ab.KafkaMessageRegular, receivedOffset int64) error {
+// !!! BEGIN MODIFICATION
+// MODIFICATION: Added second parameter ~> header of consumermessage contains merkleproof and signature of kafka
+func (chain *chainImpl) processRegular(regularMessage *ab.KafkaMessageRegular, messageHeaders []*sarama.RecordHeader, receivedOffset int64, timestamp int64, consumerMessageData []byte) error {
+	// !!! END MODIFICATION
+
 	// When committing a normal message, we also update `lastOriginalOffsetProcessed` with `newOffset`.
 	// It is caller's responsibility to deduce correct value of `newOffset` based on following rules:
 	// - if Resubmission is switched off, it should always be zero
@@ -659,7 +758,14 @@ func (chain *chainImpl) processRegular(regularMessage *ab.KafkaMessageRegular, r
 			LastOffsetPersisted:         offset,
 			LastOriginalOffsetProcessed: chain.lastOriginalOffsetProcessed,
 			LastResubmittedConfigOffset: chain.lastResubmittedConfigOffset,
+			// !!! BEGIN MODIFICATION
+			ReceivedTTCMessage:          false,
+			IsConfigMessage:             false,
+			ReceivedConnectOrTTCMessage: chain.connectOrTTCPayload == nil,
+			ConnectOrTTCPayload:         chain.connectOrTTCPayload,
 		}
+		chain.connectOrTTCPayload = nil
+		// !!! END MODIFICATION
 		chain.WriteBlock(block, metadata)
 		chain.lastCutBlockNumber++
 		logger.Debugf("[channel: %s] Batch filled, just cut block [%d] - last persisted offset is now %d", chain.ChainID(), chain.lastCutBlockNumber, offset)
@@ -674,7 +780,14 @@ func (chain *chainImpl) processRegular(regularMessage *ab.KafkaMessageRegular, r
 				LastOffsetPersisted:         offset,
 				LastOriginalOffsetProcessed: newOffset,
 				LastResubmittedConfigOffset: chain.lastResubmittedConfigOffset,
+				// !!! BEGIN MODIFICATION
+				ReceivedTTCMessage:          false,
+				IsConfigMessage:             false,
+				ReceivedConnectOrTTCMessage: chain.connectOrTTCPayload == nil,
+				ConnectOrTTCPayload:         chain.connectOrTTCPayload,
 			}
+			chain.connectOrTTCPayload = nil
+			// !!! END MODIFICATION
 			chain.WriteBlock(block, metadata)
 			chain.lastCutBlockNumber++
 			logger.Debugf("[channel: %s] Batch filled, just cut block [%d] - last persisted offset is now %d", chain.ChainID(), chain.lastCutBlockNumber, offset)
@@ -699,7 +812,14 @@ func (chain *chainImpl) processRegular(regularMessage *ab.KafkaMessageRegular, r
 				LastOffsetPersisted:         receivedOffset - 1,
 				LastOriginalOffsetProcessed: chain.lastOriginalOffsetProcessed,
 				LastResubmittedConfigOffset: chain.lastResubmittedConfigOffset,
+				// !!! BEGIN MODIFICATION
+				ReceivedTTCMessage:          false,
+				IsConfigMessage:             true,
+				ReceivedConnectOrTTCMessage: chain.connectOrTTCPayload == nil,
+				ConnectOrTTCPayload:         chain.connectOrTTCPayload,
 			}
+			chain.connectOrTTCPayload = nil
+			// !!! END MODIFICATION
 			chain.WriteBlock(block, metadata)
 			chain.lastCutBlockNumber++
 		}
@@ -711,7 +831,14 @@ func (chain *chainImpl) processRegular(regularMessage *ab.KafkaMessageRegular, r
 			LastOffsetPersisted:         receivedOffset,
 			LastOriginalOffsetProcessed: chain.lastOriginalOffsetProcessed,
 			LastResubmittedConfigOffset: chain.lastResubmittedConfigOffset,
+			// !!! BEGIN MODIFICATION
+			ReceivedTTCMessage:          false,
+			IsConfigMessage:             true,
+			ReceivedConnectOrTTCMessage: chain.connectOrTTCPayload == nil,
+			ConnectOrTTCPayload:         chain.connectOrTTCPayload,
 		}
+		chain.connectOrTTCPayload = nil
+		// !!! END MODIFICATION
 		chain.WriteConfigBlock(block, metadata)
 		chain.lastCutBlockNumber++
 		chain.timer = nil
@@ -724,6 +851,31 @@ func (chain *chainImpl) processRegular(regularMessage *ab.KafkaMessageRegular, r
 		// This shouldn't happen, it should be filtered at ingress
 		return fmt.Errorf("failed to unmarshal payload of regular message because = %s", err)
 	}
+
+	// !!! BEGIN MODIFICATION
+	// add headers to envelope ~> later this envelope is marshalled and sent to the peers
+	regMessage := &cb.KafkaReg_Payload{
+		ConfigSeq:            regularMessage.ConfigSeq,
+		Class:                cb.KafkaReg_Payload_Class(regularMessage.Class),
+		OriginalOffset:       regularMessage.OriginalOffset,
+		XXX_NoUnkeyedLiteral: regularMessage.XXX_NoUnkeyedLiteral,
+		XXX_unrecognized:     regularMessage.XXX_unrecognized,
+		XXX_sizecache:        regularMessage.XXX_sizecache,
+	}
+
+	kafkaPayload := &cb.KafkaPayload{
+		KafkaMerkleProofHeader: messageHeaders[0].Value,
+		KafkaSignatureHeader:   messageHeaders[1].Value,
+		KafkaOffset:            receivedOffset,
+		KafkaTimestamp:         timestamp,
+		KafkaRegularMessage:    regMessage,
+	}
+
+	env.KafkaPayload = kafkaPayload
+
+	logger.Infof("!!$!! Added Header Information of Kafka !!§!! ")
+
+	// !!! END MODIFICATION
 
 	logger.Debugf("[channel: %s] Processing regular Kafka message of type %s", chain.ChainID(), regularMessage.Class.String())
 
@@ -774,6 +926,20 @@ func (chain *chainImpl) processRegular(regularMessage *ab.KafkaMessageRegular, r
 		logger.Panicf("[channel: %s] Kafka message of type UNKNOWN should have been processed already", chain.ChainID())
 
 	case ab.KafkaMessageRegular_NORMAL:
+		// !!! BEGIN MODIFICATION
+		if chain.connectOrTTCPayload == nil {
+			chain.connectOrTTCPayload = make([]*ab.KafkaPayload, 0)
+		}
+
+		connectOrTTCPayload := &ab.KafkaPayload{
+			KafkaMerkleProofHeader: messageHeaders[0].Value,
+			KafkaSignatureHeader:   messageHeaders[1].Value,
+			ConsumerMessageBytes:   consumerMessageData,
+		}
+
+		chain.connectOrTTCPayload = append(chain.connectOrTTCPayload, connectOrTTCPayload)
+		// !!! END MODIFICATION
+
 		// This is a message that is re-validated and re-ordered
 		if regularMessage.OriginalOffset != 0 {
 			logger.Debugf("[channel: %s] Received re-submitted normal message with original offset %d", chain.ChainID(), regularMessage.OriginalOffset)
@@ -823,9 +989,30 @@ func (chain *chainImpl) processRegular(regularMessage *ab.KafkaMessageRegular, r
 			offset = chain.lastOriginalOffsetProcessed
 		}
 
+		// !!! BEGIN MODIFICATION
+		if len(chain.connectOrTTCPayload) == 1 {
+			chain.connectOrTTCPayload = nil
+		} else {
+			chain.connectOrTTCPayload = chain.connectOrTTCPayload[:len(chain.connectOrTTCPayload)-1]
+		}
+		// !!! END MODIFICATION
+
 		commitNormalMsg(env, offset)
 
 	case ab.KafkaMessageRegular_CONFIG:
+		// !!! BEGIN MODIFICATION
+		if chain.connectOrTTCPayload == nil {
+			chain.connectOrTTCPayload = make([]*ab.KafkaPayload, 0)
+		}
+
+		connectOrTTCPayload := &ab.KafkaPayload{
+			KafkaMerkleProofHeader: messageHeaders[0].Value,
+			KafkaSignatureHeader:   messageHeaders[1].Value,
+			ConsumerMessageBytes:   consumerMessageData,
+		}
+
+		chain.connectOrTTCPayload = append(chain.connectOrTTCPayload, connectOrTTCPayload)
+		// !!! END MODIFICATION
 		// This is a message that is re-validated and re-ordered
 		if regularMessage.OriginalOffset != 0 {
 			logger.Debugf("[channel: %s] Received re-submitted config message with original offset %d", chain.ChainID(), regularMessage.OriginalOffset)
@@ -889,6 +1076,14 @@ func (chain *chainImpl) processRegular(regularMessage *ab.KafkaMessageRegular, r
 			offset = chain.lastOriginalOffsetProcessed
 		}
 
+		// !!! BEGIN MODIFICATION
+		if len(chain.connectOrTTCPayload) == 1 {
+			chain.connectOrTTCPayload = nil
+		} else {
+			chain.connectOrTTCPayload = chain.connectOrTTCPayload[:len(chain.connectOrTTCPayload)-1]
+		}
+		// !!! END MODIFICATION
+
 		commitConfigMsg(env, offset)
 
 	default:
@@ -898,9 +1093,13 @@ func (chain *chainImpl) processRegular(regularMessage *ab.KafkaMessageRegular, r
 	return nil
 }
 
-func (chain *chainImpl) processTimeToCut(ttcMessage *ab.KafkaMessageTimeToCut, receivedOffset int64) error {
+// !!! BEGIN MODIFICATION
+func (chain *chainImpl) processTimeToCut(ttcMessage *ab.KafkaMessageTimeToCut, receivedOffset int64, consumerMessageData []byte, messageHeaders []*sarama.RecordHeader) error {
+	// !!! END MODIFICATION
+
 	ttcNumber := ttcMessage.GetBlockNumber()
 	logger.Debugf("[channel: %s] It's a time-to-cut message for block [%d]", chain.ChainID(), ttcNumber)
+	logger.Debugf("!!§!! ")
 	if ttcNumber == chain.lastCutBlockNumber+1 {
 		chain.timer = nil
 		logger.Debugf("[channel: %s] Nil'd the timer", chain.ChainID())
@@ -910,10 +1109,22 @@ func (chain *chainImpl) processTimeToCut(ttcMessage *ab.KafkaMessageTimeToCut, r
 				" no pending requests though; this might indicate a bug", chain.lastCutBlockNumber+1)
 		}
 		block := chain.CreateNextBlock(batch)
+		// !!! BEGIN MODIFICATION
+		// Metadata and Header of block is signed by the orderer
 		metadata := &ab.KafkaMetadata{
 			LastOffsetPersisted:         receivedOffset,
 			LastOriginalOffsetProcessed: chain.lastOriginalOffsetProcessed,
+			ReceivedTTCMessage:          true,
+			IsConfigMessage:             false,
+			TTCPayload: &ab.KafkaPayload{
+				KafkaMerkleProofHeader: messageHeaders[0].Value,
+				KafkaSignatureHeader:   messageHeaders[1].Value,
+				ConsumerMessageBytes:   consumerMessageData,
+			},
+			ReceivedConnectOrTTCMessage: chain.connectOrTTCPayload == nil,
+			ConnectOrTTCPayload:         chain.connectOrTTCPayload,
 		}
+		chain.connectOrTTCPayload = nil
 		chain.WriteBlock(block, metadata)
 		chain.lastCutBlockNumber++
 		logger.Debugf("[channel: %s] Proper time-to-cut received, just cut block [%d]", chain.ChainID(), chain.lastCutBlockNumber)
@@ -923,7 +1134,19 @@ func (chain *chainImpl) processTimeToCut(ttcMessage *ab.KafkaMessageTimeToCut, r
 			" - this might indicate a bug", ttcNumber, chain.lastCutBlockNumber+1)
 	}
 	logger.Debugf("[channel: %s] Ignoring stale time-to-cut-message for block [%d]", chain.ChainID(), ttcNumber)
+	if chain.connectOrTTCPayload == nil {
+		chain.connectOrTTCPayload = make([]*ab.KafkaPayload, 0)
+	}
+
+	connectOrTTCPayload := &ab.KafkaPayload{
+		KafkaMerkleProofHeader: messageHeaders[0].Value,
+		KafkaSignatureHeader:   messageHeaders[1].Value,
+		ConsumerMessageBytes:   consumerMessageData,
+	}
+
+	chain.connectOrTTCPayload = append(chain.connectOrTTCPayload, connectOrTTCPayload)
 	return nil
+	// !!! END MODIFICATION
 }
 
 // WriteBlock acts as a wrapper around the consenter support WriteBlock, encoding the metadata,
@@ -973,37 +1196,41 @@ func sendTimeToCut(producer sarama.SyncProducer, channel channel, timeToCutBlock
 	return err
 }
 
-// Sets up the partition consumer for a channel using the given retry options.
-func setupChannelConsumerForChannel(retryOptions localconfig.Retry, haltChan chan struct{}, parentConsumer sarama.Consumer, channel channel, startFrom int64) (sarama.PartitionConsumer, error) {
-	var err error
-	var channelConsumer sarama.PartitionConsumer
+// !!! BEGIN MODIFIED
 
-	logger.Infof("[channel: %s] Setting up the channel consumer for this channel (start offset: %d)...", channel.topic(), startFrom)
+// // Sets up the partition consumer for a channel using the given retry options.
+// func setupChannelConsumerForChannel(retryOptions localconfig.Retry, haltChan chan struct{}, parentConsumer sarama.Consumer, channel channel, startFrom int64) (sarama.PartitionConsumer, error) {
+// 	var err error
+// 	var channelConsumer sarama.PartitionConsumer
 
-	retryMsg := "Connecting to the Kafka cluster"
-	setupChannelConsumer := newRetryProcess(retryOptions, haltChan, channel, retryMsg, func() error {
-		channelConsumer, err = parentConsumer.ConsumePartition(channel.topic(), channel.partition(), startFrom)
-		return err
-	})
+// 	logger.Infof("[channel: %s] Setting up the channel consumer for this channel (start offset: %d)...", channel.topic(), startFrom)
 
-	return channelConsumer, setupChannelConsumer.retry()
-}
+// 	retryMsg := "Connecting to the Kafka cluster"
+// 	setupChannelConsumer := newRetryProcess(retryOptions, haltChan, channel, retryMsg, func() error {
+// 		channelConsumer, err = parentConsumer.ConsumePartition(channel.topic(), channel.partition(), startFrom)
+// 		return err
+// 	})
 
-// Sets up the parent consumer for a channel using the given retry options.
-func setupParentConsumerForChannel(retryOptions localconfig.Retry, haltChan chan struct{}, brokers []string, brokerConfig *sarama.Config, channel channel) (sarama.Consumer, error) {
-	var err error
-	var parentConsumer sarama.Consumer
+// 	return channelConsumer, setupChannelConsumer.retry()
+// }
 
-	logger.Infof("[channel: %s] Setting up the parent consumer for this channel...", channel.topic())
+// // Sets up the parent consumer for a channel using the given retry options.
+// func setupParentConsumerForChannel(retryOptions localconfig.Retry, haltChan chan struct{}, brokers []string, brokerConfig *sarama.Config, channel channel) (sarama.Consumer, error) {
+// 	var err error
+// 	var parentConsumer sarama.Consumer
 
-	retryMsg := "Connecting to the Kafka cluster"
-	setupParentConsumer := newRetryProcess(retryOptions, haltChan, channel, retryMsg, func() error {
-		parentConsumer, err = sarama.NewConsumer(brokers, brokerConfig)
-		return err
-	})
+// 	logger.Infof("[channel: %s] Setting up the parent consumer for this channel...", channel.topic())
 
-	return parentConsumer, setupParentConsumer.retry()
-}
+// 	retryMsg := "Connecting to the Kafka cluster"
+// 	setupParentConsumer := newRetryProcess(retryOptions, haltChan, channel, retryMsg, func() error {
+// 		parentConsumer, err = sarama.NewConsumer(brokers, brokerConfig)
+// 		return err
+// 	})
+
+// 	return parentConsumer, setupParentConsumer.retry()
+// }
+
+// !!! END MODIFIED
 
 // Sets up the writer/producer for a channel using the given retry options.
 func setupProducerForChannel(retryOptions localconfig.Retry, haltChan chan struct{}, brokers []string, brokerConfig *sarama.Config, channel channel) (sarama.SyncProducer, error) {
@@ -1179,3 +1406,51 @@ func getHealthyClusterReplicaInfo(retryOptions localconfig.Retry, haltChan chan 
 
 	return replicaIDs, getReplicaInfo.retry()
 }
+
+// !!! BEGIN MODIFICATIONS
+
+// Fabric Star Helper Methods
+
+// Sets up the parent header consumer for a channel using the given retry options.
+func setupParentHeaderConsumerForChannel(consenter commonConsenter, retryOptions localconfig.Retry, haltChan chan struct{}, brokers []string, brokerConfig *sarama.Config, channel channel) (sarama.Consumer, error) {
+	var err error
+	var parentConsumer sarama.Consumer
+
+	kafkaConfig := consenter.kafkaConfig()
+	kafkaVersion, _ := sarama.ParseKafkaVersion("1.0.2")
+
+	config := newBrokerConfig(
+		kafkaConfig.TLS,
+		kafkaConfig.SASLPlain,
+		kafkaConfig.Retry,
+		kafkaVersion,
+		defaultPartition)
+
+	logger.Infof("!!§!! [channel: %s] Setting up the parent header consumer for this channel... !!§!!", channel.topic())
+
+	retryMsg := "Connecting to the Kafka cluster"
+	setupParentConsumer := newRetryProcess(retryOptions, haltChan, channel, retryMsg, func() error {
+		parentConsumer, err = sarama.NewConsumer(brokers, config)
+		return err
+	})
+
+	return parentConsumer, setupParentConsumer.retry()
+}
+
+// Sets up the partition consumer for a channel using the given retry options.
+func setupChannelHeaderConsumerForChannel(retryOptions localconfig.Retry, haltChan chan struct{}, parentConsumer sarama.Consumer, channel channel, startFrom int64) (sarama.PartitionConsumer, error) {
+	var err error
+	var channelConsumer sarama.PartitionConsumer
+
+	logger.Infof("!!§!! [channel: %s] Setting up the channel consumer for this channel to consume the headers (start offset: %d)... !!$!!", channel.topic(), startFrom)
+
+	retryMsg := "Connecting to the Kafka cluster"
+	setupChannelConsumer := newRetryProcess(retryOptions, haltChan, channel, retryMsg, func() error {
+		channelConsumer, err = parentConsumer.ConsumePartition(channel.topic(), channel.partition(), startFrom)
+		return err
+	})
+
+	return channelConsumer, setupChannelConsumer.retry()
+}
+
+// !!! END MODIFICATIONS

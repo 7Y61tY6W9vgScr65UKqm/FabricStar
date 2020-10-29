@@ -142,6 +142,25 @@ message Payload {
     bytes data = 2;
 }
 
+message KafkaReg_Payload {
+    enum Class {
+        UNKNOWN = 0;
+        NORMAL = 1;
+        CONFIG = 2;
+    }
+    uint64 config_seq = 1;
+    Class class = 2;
+    int64 original_offset = 3;
+}
+
+message KafkaPayload {
+    bytes kafka_merkle_proof_header = 1;
+    bytes kafka_signature_header = 2;
+    int64 kafka_offset = 3;
+    int64 kafka_timestamp = 4;
+    KafkaReg_Payload kafka_regular_message = 5;
+}
+
 // Envelope wraps a Payload with a signature so that the message may be authenticated
 message Envelope {
     // A marshaled Payload
@@ -149,6 +168,20 @@ message Envelope {
 
     // A signature by the creator specified in the Payload header
     bytes signature = 2;
+
+    KafkaPayload kafka_payload = 3;
+}
+
+// KafkaMessageRegular wraps a marshalled envelope.
+message KafkaMessageRegular {
+    enum Class {
+        UNKNOWN = 0;
+        NORMAL = 1;
+        CONFIG = 2;
+    }
+    uint64 config_seq = 1;
+    Class class = 2;
+    int64 original_offset = 3;
 }
 
 // This is finalized block structure to be shared among the orderer and peer

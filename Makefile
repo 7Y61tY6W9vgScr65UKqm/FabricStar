@@ -232,13 +232,15 @@ $(BUILD_DIR)/docker/bin/%: $(PROJECT_FILES)
 	$(eval TARGET = ${patsubst $(BUILD_DIR)/docker/bin/%,%,${@}})
 	@echo "Building $@"
 	@mkdir -p $(BUILD_DIR)/docker/bin $(BUILD_DIR)/docker/$(TARGET)/pkg $(BUILD_DIR)/docker/gocache
-	@$(DRUN) \
+	@cat scripts/baseimage.sh | $(DRUN) \
 		-v $(abspath $(BUILD_DIR)/docker/bin):/opt/gopath/bin \
 		-v $(abspath $(BUILD_DIR)/docker/$(TARGET)/pkg):/opt/gopath/pkg \
 		-v $(abspath $(BUILD_DIR)/docker/gocache):/opt/gopath/cache \
+		-v $(abspath libsodium):/opt/gopath/libsodium \
 		-e GOCACHE=/opt/gopath/cache \
 		$(BASE_DOCKER_NS)/fabric-baseimage:$(BASE_DOCKER_TAG) \
-		go install -tags "$(GO_TAGS)" -ldflags "$(DOCKER_GO_LDFLAGS)" $(pkgmap.$(@F))
+		/bin/bash
+		# go install -tags "$(GO_TAGS)" -ldflags="$(DOCKER_GO_LDFLAGS)" $(pkgmap.$(@F))
 	@touch $@
 
 $(BUILD_DIR)/bin:
@@ -309,12 +311,12 @@ $(BUILD_DIR)/image/tools/$(DUMMY): $(BUILD_DIR)/image/tools/Dockerfile
 $(BUILD_DIR)/image/%/$(DUMMY): Makefile $(BUILD_DIR)/image/%/payload $(BUILD_DIR)/image/%/Dockerfile
 	$(eval TARGET = ${patsubst $(BUILD_DIR)/image/%/$(DUMMY),%,${@}})
 	@echo "Building docker $(TARGET)-image"
-	$(DBUILD) -t $(DOCKER_NS)/fabric-$(TARGET) $(@D)
-	docker tag $(DOCKER_NS)/fabric-$(TARGET) $(DOCKER_NS)/fabric-$(TARGET):$(DOCKER_TAG)
-	docker tag $(DOCKER_NS)/fabric-$(TARGET) $(DOCKER_NS)/fabric-$(TARGET):$(ARCH)-latest
-	docker tag $(DOCKER_NS)/fabric-$(TARGET) $(DOCKER_NS)/fabric-$(TARGET):$(BASE_VERSION)
-	docker tag $(DOCKER_NS)/fabric-$(TARGET) $(DOCKER_NS)/fabric-$(TARGET):$(TWO_DIGIT_VERSION)
-	docker tag $(DOCKER_NS)/fabric-$(TARGET) $(DOCKER_NS)/fabric-$(TARGET)
+	$(DBUILD) -t fabric_star/fabric-$(TARGET) $(@D)
+	docker tag fabric_star/fabric-$(TARGET) fabric_star/fabric-$(TARGET):$(DOCKER_TAG)
+	docker tag fabric_star/fabric-$(TARGET) fabric_star/fabric-$(TARGET):$(ARCH)-latest
+	docker tag fabric_star/fabric-$(TARGET) fabric_star/fabric-$(TARGET):$(BASE_VERSION)
+	docker tag fabric_star/fabric-$(TARGET) fabric_star/fabric-$(TARGET):$(TWO_DIGIT_VERSION)
+	docker tag fabric_star/fabric-$(TARGET) fabric_star/fabric-$(TARGET)
 	@touch $@
 
 $(BUILD_DIR)/gotools.tar.bz2: $(BUILD_DIR)/docker/gotools

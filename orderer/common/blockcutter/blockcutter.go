@@ -134,5 +134,7 @@ func (r *receiver) Cut() []*cb.Envelope {
 }
 
 func messageSizeBytes(message *cb.Envelope) uint32 {
-	return uint32(len(message.Payload) + len(message.Signature))
+	// !!! BEGIN MODIFICATION
+	return uint32(len(message.Payload) + len(message.Signature) + len(message.KafkaPayload.KafkaMerkleProofHeader) + len(message.KafkaPayload.KafkaSignatureHeader) + 1)
+	// !!! END MODIFICATION
 }

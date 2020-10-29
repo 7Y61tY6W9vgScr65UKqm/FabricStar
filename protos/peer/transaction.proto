@@ -13,8 +13,8 @@ option java_outer_classname = "TransactionPackage";
 package protos;
 
 import "google/protobuf/timestamp.proto";
-import "peer/proposal_response.proto";
-import "common/common.proto";
+import "github.com/hyperledger/fabric/protos/peer/proposal_response.proto";
+import "github.com/hyperledger/fabric/protos/common/common.proto";
 
 // This message is necessary to facilitate the verification of the signature
 // (in the signature field) over the bytes of the transaction (in the
@@ -138,6 +138,9 @@ enum TxValidationCode {
 	BAD_RWSET = 22;
 	ILLEGAL_WRITESET = 23;
 	INVALID_WRITESET = 24;
+	INVALID_KAFKAMERKLEPROOF = 25;
+	INVALID_KAFKASIGNATURE = 26;
+	INVALID_KAFKASEQUENCENUMBER = 27;
 	NOT_VALIDATED = 254;
 	INVALID_OTHER_REASON = 255;
 }

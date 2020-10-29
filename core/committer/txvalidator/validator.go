@@ -8,7 +8,9 @@ package txvalidator
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/golang/protobuf/proto"
@@ -25,6 +27,7 @@ import (
 	"github.com/hyperledger/fabric/msp"
 	"github.com/hyperledger/fabric/protos/common"
 	mspprotos "github.com/hyperledger/fabric/protos/msp"
+	ab "github.com/hyperledger/fabric/protos/orderer"
 	"github.com/hyperledger/fabric/protos/peer"
 	"github.com/hyperledger/fabric/protos/utils"
 	"github.com/pkg/errors"
@@ -76,7 +79,18 @@ type TxValidator struct {
 	ChainID string
 	Support Support
 	Vscc    vsccValidator
+	// !!! BEGIN MODIFICATION
+	KafkaOffset         int
+	NewKafkaOffset      int
+	ConnectOrTTCOffsets []int
 }
+
+type kafkaValidationResult struct {
+	kafkaOffset int
+	err         error
+}
+
+// !!! END MODIFICATION
 
 var logger = flogging.MustGetLogger("committer.txvalidator")
 
@@ -100,9 +114,10 @@ func NewTxValidator(chainID string, support Support, sccp sysccprovider.SystemCh
 	// Encapsulates interface implementation
 	pluginValidator := NewPluginValidator(pm, support.Ledger(), &dynamicDeserializer{support: support}, &dynamicCapabilities{support: support})
 	return &TxValidator{
-		ChainID: chainID,
-		Support: support,
-		Vscc:    newVSCCValidator(chainID, support, sccp, pluginValidator)}
+		ChainID:     chainID,
+		Support:     support,
+		Vscc:        newVSCCValidator(chainID, support, sccp, pluginValidator),
+		KafkaOffset: 0}
 }
 
 func (v *TxValidator) chainExists(chain string) bool {
@@ -137,6 +152,30 @@ func (v *TxValidator) Validate(block *common.Block) error {
 	startValidation := time.Now() // timer to log Validate block duration
 	logger.Debugf("[%s] START Block Validation for block [%d]", v.ChainID, block.Header.Number)
 
+	// !!! BEGIN MODIFICATION
+	v.NewKafkaOffset = v.KafkaOffset
+
+	//Here we regain information about how and why the block was cut by the orderer
+	//First we retrieve the KafkaMeta data containing either the TTC Messages / Connect Messages or information about the block size
+	ordererMetadata := &common.Metadata{}
+	err = proto.Unmarshal(block.Metadata.Metadata[common.BlockMetadataIndex_ORDERER], ordererMetadata)
+	if err != nil {
+		return err
+	}
+
+	kafkaMetadata := &ab.KafkaMetadata{}
+	err = proto.Unmarshal(ordererMetadata.Value, kafkaMetadata)
+	if err != nil {
+		return err
+	}
+
+	//Afterwards we check, if the orderer was correct to cut the block here
+	if err = v.validateConnectOrTTCMessages(kafkaMetadata); err != nil {
+		return err
+	}
+
+	// !!! END MODIFICATION
+
 	// Initialize trans as valid here, then set invalidation reason code upon invalidation below
 	txsfltr := ledgerUtil.NewTxValidationFlags(len(block.Data.Data))
 	// txsChaincodeNames records all the invoked chaincodes by tx in a block
@@ -147,22 +186,37 @@ func (v *TxValidator) Validate(block *common.Block) error {
 	txidArray := make([]string, len(block.Data.Data))
 
 	results := make(chan *blockValidationResult)
+
+	// !!! BEGIN MODIFICATION
+	additionalKafkaOffset := 0
 	go func() {
 		for tIdx, d := range block.Data.Data {
 			// ensure that we don't have too many concurrent validation workers
 			v.Support.Acquire(context.Background(), 1)
 
-			go func(index int, data []byte) {
+			for v.ConnectOrTTCOffsets != nil && v.NewKafkaOffset+tIdx+additionalKafkaOffset == v.ConnectOrTTCOffsets[0] {
+				logger.Infof("!!§!! Corrected Offset %d to %d !!§!!", v.NewKafkaOffset+tIdx+additionalKafkaOffset, v.NewKafkaOffset+tIdx+additionalKafkaOffset+1)
+				logger.Infof("!!§!! Offsets remaining in Queue: ", v.ConnectOrTTCOffsets, " !!§!!")
+				additionalKafkaOffset++
+				if len(v.ConnectOrTTCOffsets) == 1 {
+					v.ConnectOrTTCOffsets = nil
+				} else {
+					v.ConnectOrTTCOffsets = v.ConnectOrTTCOffsets[1:]
+				}
+			}
+
+			go func(index int, additionalOffset int, data []byte) {
 				defer v.Support.Release(1)
 
 				v.validateTx(&blockValidationRequest{
 					d:     data,
 					block: block,
 					tIdx:  index,
-				}, results)
-			}(tIdx, d)
+				}, additionalOffset, results)
+			}(tIdx, additionalKafkaOffset, d)
 		}
 	}()
+	// !!! END MODIFICATION
 
 	logger.Debugf("expecting %d block validation responses", len(block.Data.Data))
 
@@ -206,6 +260,30 @@ func (v *TxValidator) Validate(block *common.Block) error {
 		return err
 	}
 
+	// !!! BEGIN MODIFICATION
+
+	v.NewKafkaOffset += len(block.Data.Data) + additionalKafkaOffset
+
+	for len(v.ConnectOrTTCOffsets) > 0 {
+		if v.NewKafkaOffset != v.ConnectOrTTCOffsets[0] {
+			logger.Errorf("!!§!! Unhandled Connect/TTC Message contains invalid Sequence Number !!§!!")
+			return fmt.Errorf("!!§!! Unhandled Connect/TTC Message contains invalid Sequence Number !!§!! ")
+		}
+		v.NewKafkaOffset++
+		v.ConnectOrTTCOffsets = v.ConnectOrTTCOffsets[1:]
+	}
+
+	v.ConnectOrTTCOffsets = nil
+
+	//Afterwards we check, if the orderer was correct to cut the block here
+	if err = v.validateTTCMessages(kafkaMetadata); err != nil {
+		return err
+	}
+
+	logger.Infof("!!§!! Kafka Offset updated old ", v.KafkaOffset, " new ", v.NewKafkaOffset)
+	v.KafkaOffset = v.NewKafkaOffset
+	// !!! END MODIFICATION
+
 	// if we operate with this capability, we mark invalid any transaction that has a txid
 	// which is equal to that of a previous tx in this block
 	if v.Support.Capabilities().ForbidDuplicateTXIdInBlock() {
@@ -232,6 +310,126 @@ func (v *TxValidator) Validate(block *common.Block) error {
 	logger.Infof("[%s] Validated block [%d] in %dms", v.ChainID, block.Header.Number, elapsedValidation)
 
 	return nil
+}
+
+//Here, the signature and merkle proof of the kafka cluster is validated.
+func (v *TxValidator) validateConnectOrTTCMessages(kafkaMetadata *ab.KafkaMetadata) error {
+	if len(kafkaMetadata.ConnectOrTTCPayload) != 0 {
+		logger.Infof("!!§!! Got Connect of TTC Messages of old blocks !!§!!")
+
+		results := make(chan *kafkaValidationResult)
+		go func() {
+			for _, payload := range kafkaMetadata.ConnectOrTTCPayload {
+				go func(data *ab.KafkaPayload) {
+					v.validateKafkaPayload(data, results)
+				}(payload)
+			}
+		}()
+
+		// handles returned offsets
+		v.ConnectOrTTCOffsets = make([]int, len(kafkaMetadata.ConnectOrTTCPayload))
+		var err error
+		for i := 0; i < len(kafkaMetadata.ConnectOrTTCPayload); i++ {
+			res := <-results
+			// if we get an error we buffer it and wait till all goroutines have terminated
+			// it is sufficient to return a single error in case there is one
+			if res.err != nil {
+				err = res.err
+			}
+			v.ConnectOrTTCOffsets[i] = res.kafkaOffset
+		}
+		if err != nil {
+			return err
+		}
+
+		// sorts slice in increasing order
+		sort.Ints(v.ConnectOrTTCOffsets)
+		logger.Infof("!!§!! Offsets in Queue after Sorting: ", v.ConnectOrTTCOffsets, " !!§!!")
+		// the gathered offsets can contain gaps (e.g if the orderer enqueued another envelope before sending the TTC)
+		// thus, we only update the v.kafkaOffset value as far as we can and fill the gaps later on
+		// invariant: v.ConnectOrTTCOffsets has to be empty after the block is fully validated
+		for offset := range v.ConnectOrTTCOffsets {
+			if offset == v.NewKafkaOffset {
+				v.NewKafkaOffset++
+			} else {
+				break
+			}
+		}
+		//update list to the offset after the first gap
+		if v.NewKafkaOffset-v.KafkaOffset == len(v.ConnectOrTTCOffsets) {
+			v.ConnectOrTTCOffsets = nil
+		} else {
+			v.ConnectOrTTCOffsets = v.ConnectOrTTCOffsets[v.NewKafkaOffset-v.KafkaOffset:]
+		}
+		logger.Infof("!!§!! Offsets remaining in Queue: ", v.ConnectOrTTCOffsets, " !!§!!")
+	}
+	return nil
+}
+
+//Here, the signature and merkle proof of the kafka cluster is validated.
+func (v *TxValidator) validateTTCMessages(kafkaMetadata *ab.KafkaMetadata) error {
+	if kafkaMetadata.TTCPayload != nil {
+		logger.Infof("!!§!! Got TTC Message of current block !!§!!")
+		// validate
+		results := make(chan *kafkaValidationResult)
+		go func() {
+			v.validateKafkaPayload(kafkaMetadata.TTCPayload, results)
+		}()
+
+		// check response for kafkaOffset and errors
+		response := <-results
+		if response.err != nil {
+			return response.err
+		}
+
+		// all gaps of offsets should be closed and the offset of the ttc message should be the last one
+		if v.NewKafkaOffset != response.kafkaOffset {
+			logger.Errorf("!!§!! Invalid Sequence Number of TTC Message !!§!!")
+			return fmt.Errorf("!!§!! Invalid Sequence Number of TTC Message !!§!! ")
+		}
+
+		// otherwise update
+		logger.Infof("!!§!! Kafka Offset updated (TTC Message)")
+		v.NewKafkaOffset++
+	}
+	return nil
+}
+
+func (v *TxValidator) validateKafkaPayload(payload *ab.KafkaPayload, responseChannel chan<- *kafkaValidationResult) {
+	logger.Infof("!!§!! Retrieving Sequence Number !!§!!")
+	offset := int(binary.BigEndian.Uint64(payload.ConsumerMessageBytes[0:8]))
+
+	proof := GetProofFromBytes(payload.KafkaMerkleProofHeader)
+
+	logger.Infof("!!§!! Checking TTC/Connect Kafka Proof !!§!!")
+
+	//Verify Merkle Proof
+	if !proof.VerifyProof(payload.ConsumerMessageBytes) {
+		logger.Errorf("!!$!! Invalid Merkle Proof for TTC/Connect Message !!$!! ")
+		responseChannel <- &kafkaValidationResult{
+			kafkaOffset: offset,
+			err:         fmt.Errorf("!!$!! Invalid Merkle Proof for TTC/Connect Message !!$!! "),
+		}
+	}
+
+	logger.Infof("!!§!! TTC/Connect Kafka Proof is valid !!§!!")
+
+	logger.Infof("!!§!! Checking Kafka Signature of TTC/Connect Message !!§!!")
+
+	//Verify Signature
+	if proof.VerifySignature(payload.KafkaSignatureHeader) != nil {
+		logger.Errorf("!!$!! Invalid Kafka Signature for TTC/Connect Message !!$!!")
+		responseChannel <- &kafkaValidationResult{
+			kafkaOffset: offset,
+			err:         fmt.Errorf("!!$!! Invalid Kafka Signature for TTC/Connect Message !!$!! "),
+		}
+	}
+
+	logger.Infof("!!§!! Kafka Signature of TTC/Connect Message is valid !!§!!")
+	responseChannel <- &kafkaValidationResult{
+		kafkaOffset: offset,
+		err:         nil,
+	}
 }
 
 // allValidated returns error if some of the validation flags have not been set
@@ -264,7 +462,7 @@ func markTXIdDuplicates(txids []string, txsfltr ledgerUtil.TxValidationFlags) {
 	}
 }
 
-func (v *TxValidator) validateTx(req *blockValidationRequest, results chan<- *blockValidationResult) {
+func (v *TxValidator) validateTx(req *blockValidationRequest, additionalKafkaOffset int, results chan<- *blockValidationResult) {
 	block := req.block
 	d := req.d
 	tIdx := req.tIdx
@@ -381,6 +579,14 @@ func (v *TxValidator) validateTx(req *blockValidationRequest, results chan<- *bl
 				logger.Infof("Find chaincode upgrade transaction for chaincode %s on channel %s with new version %s", upgradeCC.ChaincodeName, upgradeCC.ChainID, upgradeCC.ChaincodeVersion)
 				txsUpgradedChaincode = upgradeCC
 			}
+
+			// !!! BEGIN MODIFICATION
+			kafkaRes := v.verifyKafkaTxMessage(env, results, tIdx+additionalKafkaOffset)
+			if kafkaRes != 0 {
+				return
+			}
+			// !!! END MODIFICATION
+
 			// FAB-12971 comment out below block before v1.4 cut. Will uncomment after v1.4.
 			/*
 				} else if common.HeaderType(chdr.Type) == common.HeaderType_TOKEN_TRANSACTION {
@@ -431,6 +637,14 @@ func (v *TxValidator) validateTx(req *blockValidationRequest, results chan<- *bl
 				}
 				return
 			}
+
+			// !!! BEGIN MODIFICATION
+			kafkaRes := v.verifyKafkaTxMessage(env, results, tIdx)
+			if kafkaRes != 0 {
+				return
+			}
+			// !!! END MODIFICATION
+
 			logger.Debugf("config transaction received for chain %s", channel)
 		} else {
 			logger.Warningf("Unknown transaction type [%s] in block number [%d] transaction index [%d]",
@@ -467,6 +681,89 @@ func (v *TxValidator) validateTx(req *blockValidationRequest, results chan<- *bl
 		}
 		return
 	}
+}
+
+func (v *TxValidator) verifyKafkaTxMessage(env *common.Envelope, results chan<- *blockValidationResult, tIdx int) int {
+	logger.Infof("!!§!! Checking Kafka Message Sequence Number !!§!!")
+	logger.Infof("!!§!! Expected %d, got %d !!§!!", v.NewKafkaOffset+tIdx, env.KafkaPayload.KafkaOffset)
+	if env.KafkaPayload.KafkaOffset != int64(v.NewKafkaOffset+tIdx) {
+		logger.Errorf("!!$!! Invalid Kafka Sequence %d: Got %d, expected %d !!$!! ", tIdx, env.KafkaPayload.KafkaOffset, int64(v.NewKafkaOffset+tIdx))
+		results <- &blockValidationResult{
+			tIdx:           tIdx,
+			validationCode: peer.TxValidationCode_INVALID_KAFKASEQUENCENUMBER,
+		}
+		return -1
+	}
+	logger.Infof("!!§!! Kafka Sequence Number is as expected !!§!!")
+
+	proof := GetProofFromBytes(env.KafkaPayload.KafkaMerkleProofHeader)
+
+	// Rebuild Kafkas Signed Data
+	/*
+	* In the Following we describe, how we rebuild the signed data:
+	*
+	* Kafka signs the ConsumerMessages Payload, which is a marshaled KafkaMessage.
+	* The Orderer can cast this KafkaMessage to a KafkaMessageRegular which contains the Payload of the marshaled Envelope and other fields.
+	* To avoid redundancy, we marshal the sent Envelope (!! without the newly added KafkaPayload !!) to regain the Payload of the KafkaMessageRegular.
+	 */
+	oldEnv := &common.Envelope{
+		Payload:              env.Payload,
+		Signature:            env.Signature,
+		XXX_NoUnkeyedLiteral: env.XXX_NoUnkeyedLiteral,
+		XXX_unrecognized:     env.XXX_unrecognized,
+		XXX_sizecache:        env.XXX_sizecache,
+	}
+
+	regMessagePayload, _ := proto.Marshal(oldEnv)
+
+	kafkaMessage := &ab.KafkaMessage{
+		Type: &ab.KafkaMessage_Regular{
+			Regular: &ab.KafkaMessageRegular{
+				Payload:              regMessagePayload,
+				ConfigSeq:            env.KafkaPayload.KafkaRegularMessage.ConfigSeq,
+				Class:                ab.KafkaMessageRegular_Class(env.KafkaPayload.KafkaRegularMessage.Class),
+				OriginalOffset:       env.KafkaPayload.KafkaRegularMessage.OriginalOffset,
+				XXX_NoUnkeyedLiteral: env.KafkaPayload.KafkaRegularMessage.XXX_NoUnkeyedLiteral,
+				XXX_unrecognized:     env.KafkaPayload.KafkaRegularMessage.XXX_unrecognized,
+				XXX_sizecache:        env.KafkaPayload.KafkaRegularMessage.XXX_sizecache,
+			},
+		},
+	}
+
+	marshaledData, _ := proto.Marshal(kafkaMessage)
+
+	//the signed data consists of bytesOf(KafkaOffset) + bytesOf(KafkaTimestamp) + marshaledData
+
+	kafkaSignedData := make([]byte, 16)
+	binary.BigEndian.PutUint64(kafkaSignedData[0:8], uint64(env.KafkaPayload.KafkaOffset))
+	binary.BigEndian.PutUint64(kafkaSignedData[8:16], uint64(env.KafkaPayload.KafkaTimestamp))
+	kafkaSignedData = append(kafkaSignedData, marshaledData...)
+
+	//Verify Merkle Proof
+	if !proof.VerifyProof(kafkaSignedData) {
+		logger.Errorf("!!$!! Invalid Merkle Proof with index %d !!$!! ", tIdx)
+		results <- &blockValidationResult{
+			tIdx:           tIdx,
+			validationCode: peer.TxValidationCode_INVALID_KAFKAMERKLEPROOF,
+		}
+		return -1
+	}
+
+	logger.Infof("!!§!! Kafka Proof is valid !!§!!")
+	logger.Infof("!!§!! Checking Kafka Signature !!§!!")
+
+	//Verify Signature
+	if proof.VerifySignature(env.KafkaPayload.KafkaSignatureHeader) != nil {
+		logger.Errorf("!!$!! Invalid Kafka Signature with index %d !!$!!", tIdx)
+		results <- &blockValidationResult{
+			tIdx:           tIdx,
+			validationCode: peer.TxValidationCode_INVALID_KAFKASIGNATURE,
+		}
+		return -1
+	}
+
+	logger.Infof("!!§!! Kafka Signature is valid !!§!!")
+	return 0
 }
 
 // CheckTxIdDupsLedger returns a vlockValidationResult enhanced with the respective

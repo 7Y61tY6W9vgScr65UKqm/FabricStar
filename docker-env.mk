@@ -13,7 +13,7 @@
 # limitations under the License.
 
 ifneq ($(shell uname),Darwin)
-DOCKER_RUN_FLAGS=--user=$(shell id -u)
+# DOCKER_RUN_FLAGS=--user=$(shell id -u)
 endif
 
 ifeq ($(shell uname -m),s390x)

@@ -5,6 +5,9 @@
 FROM _BASE_NS_/fabric-baseimage:_BASE_TAG_
 COPY payload/protoc-gen-go /usr/local/bin/
 ADD payload/gotools.tar.bz2 /usr/local/bin/
+RUN ldconfig
+RUN apt-get update
+RUN apt-get install -y libsodium23 libsodium-dev pkg-config
 
 # override GOCACHE=off from fabric-baseimage
 ENV GOCACHE "/tmp"

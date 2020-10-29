@@ -1,0 +1,21 @@
+
+Dokumentation zur Änderungen von Orderer in Fabric
+
+Benutzte Kafka Version: 1.0.2
+
+1. Header Informationen
+
+Nachrichten, welche von einem Kafka Broker versendet werden, beinhalten zwei neue Header Felder (merkleProof und Signature).
+Laut "https://hyperledger-fabric.readthedocs.io/en/release-1.4/kafka.html" werden Kafka Versionen zwischen 0.10 und 1.0 unterstützt,
+sobald im Code jedoch angegeben wird, dass wir Kafka 1.0.2 benutzen, treten unverständliche Kafka Replica Fehler auf.
+Da Fabric die Sarama Client Library zur Kommunikation mit Kafka nutzt, welche mindestens eine Kafka Version von 0.11 benötigt um Header 
+Felder lesen zu können wird ein Workaround benötigt.
+
+Lösung (quick & dirty): Anstelle für Producer und Consumer die Kafka Konfiguration aus config.go zu nutzen, wird für den Producer eine Kafka Version von 0.10 angegeben 
+(sodass der Programmablauf weiterhin der selbe bleibt) und für den Consumer eine Kafka Version von 1.0.2 angegeben.
+Das wird benötigt, weil ansonsten die Header Felder von Sarama verworfen werden.
+Stellen, die im Code geändert wurden sind durch
+// !!! BEGIN MODIFICATION
+...
+// !!! END MODIFICATION
+markiert. Alle Änderungen hierzu wurden in consensus/kafka/chain.go getätigt.

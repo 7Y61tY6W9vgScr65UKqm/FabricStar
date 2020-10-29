@@ -366,6 +366,14 @@
   version = "v1.0"
 
 [[projects]]
+  digest = "1:7c7590e2b086704f7c1b7ce5ee2d7b48ee433df4b132df2359414a22f88c2aba"
+  name = "github.com/jamesruan/sodium"
+  packages = ["."]
+  pruneopts = "NUT"
+  revision = "9620b83ffeae41bb650196f3f0bd53b3c41ca6e9"
+  version = "1.0.13"
+
+[[projects]]
   branch = "master"
   digest = "1:c8a452cc8dd4ef9f857570ce2be31ca257a0928bf3c2b08cd7e11972b985c6d7"
   name = "github.com/konsorten/go-windows-terminal-sequences"
@@ -978,6 +986,7 @@
     "github.com/hyperledger/fabric-amcl/amcl",
     "github.com/hyperledger/fabric-amcl/amcl/FP256BN",
     "github.com/hyperledger/fabric-lib-go/healthz",
+    "github.com/jamesruan/sodium",
     "github.com/kr/pretty",
     "github.com/miekg/pkcs11",
     "github.com/mitchellh/mapstructure",
